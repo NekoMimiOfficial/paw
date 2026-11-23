@@ -1,0 +1,113 @@
+set(NEKO_DEPS_DIR "${CMAKE_SOURCE_DIR}/target_deps")
+include("${NEKO_DEPS_DIR}/package_info.cmake")
+
+include("${NEKO_DEPS_DIR}/GenChangelog.cmake")
+set(NEKO_COPYRIGHT_SRC "${NEKO_DEPS_DIR}/debian/copyright")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NEKO_DEPS_DIR}/package_info.cmake")
+
+if(NOT DEFINED NEKO_VERSION)
+  set(NEKO_VERSION "0.0.0")
+  if(EXISTS "${NEKO_CHANGELOG_SRC}")
+    file(STRINGS "${NEKO_CHANGELOG_SRC}" NEKO_CHANGELOG_FIRST LIMIT_COUNT 1)
+    if(NEKO_CHANGELOG_FIRST MATCHES "\\(([^)]+)\\)")
+      set(NEKO_VERSION "${CMAKE_MATCH_1}")
+    endif()
+  endif()
+endif()
+
+if(NOT NEKO_PACKAGE_NAME)
+  set(NEKO_PACKAGE_NAME "paw")
+endif()
+
+set(NEKO_DIST_DIR "${CMAKE_BINARY_DIR}/dist")
+set(NEKO_PKG_NAME "${NEKO_PACKAGE_NAME}-${NEKO_VERSION}-${PAW_TARGET}-${CMAKE_SYSTEM_PROCESSOR}")
+
+file(MAKE_DIRECTORY "${NEKO_DIST_DIR}")
+
+if(NOT "${PAW_TARGET}" STREQUAL "wasi" AND NOT DOGMAONLY)
+    if(TARGET pawc)
+        install(TARGETS pawc RUNTIME DESTINATION bin COMPONENT ${NEKO_PACKAGE_NAME})
+    endif()
+    if(TARGET pawv)
+        install(TARGETS pawv RUNTIME DESTINATION bin COMPONENT ${NEKO_PACKAGE_NAME})
+    endif()
+    if(TARGET dogma_d)
+        install(TARGETS dogma_d LIBRARY DESTINATION lib ARCHIVE DESTINATION lib COMPONENT ${NEKO_PACKAGE_NAME})
+    endif()
+    if(TARGET dogma_s)
+        install(TARGETS dogma_s ARCHIVE DESTINATION lib COMPONENT ${NEKO_PACKAGE_NAME})
+    endif()
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/include/dogma.h" DESTINATION include/paw COMPONENT ${NEKO_PACKAGE_NAME})
+endif()
+
+if(EXISTS "${NEKO_CHANGELOG_SRC}")
+  set(NEKO_CHANGELOG_GZ "${CMAKE_BINARY_DIR}/changelog.Debian.gz")
+  execute_process(COMMAND gzip -9n -c "${NEKO_CHANGELOG_SRC}" OUTPUT_FILE "${NEKO_CHANGELOG_GZ}")
+  install(FILES "${NEKO_CHANGELOG_GZ}" DESTINATION share/doc/${NEKO_PACKAGE_NAME} COMPONENT ${NEKO_PACKAGE_NAME})
+endif()
+
+if(EXISTS "${NEKO_COPYRIGHT_SRC}")
+  install(FILES "${NEKO_COPYRIGHT_SRC}" DESTINATION share/doc/${NEKO_PACKAGE_NAME} COMPONENT ${NEKO_PACKAGE_NAME})
+endif()
+
+set(NEKO_DEB_SCRIPTS "")
+foreach(script preinst postinst prerm postrm)
+  if(EXISTS "${NEKO_DEPS_DIR}/debian/${script}")
+    list(APPEND NEKO_DEB_SCRIPTS "${NEKO_DEPS_DIR}/debian/${script}")
+  endif()
+endforeach()
+
+set(CPACK_GENERATOR DEB)
+set(CPACK_PACKAGE_NAME "${NEKO_PACKAGE_NAME}")
+set(CPACK_PACKAGE_VERSION "${NEKO_VERSION}")
+set(CPACK_PACKAGE_CONTACT "${NEKO_MAINTAINER}")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${NEKO_SUMMARY}")
+set(CPACK_PACKAGE_DESCRIPTION "${NEKO_DESCRIPTION}")
+set(CPACK_PACKAGE_DIRECTORY "${NEKO_DIST_DIR}")
+set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
+set(CPACK_SET_DESTDIR ON)
+set(CPACK_DEB_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_ALL "${NEKO_PACKAGE_NAME}")
+set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_DEBIAN_PACKAGE_SECTION "${NEKO_DEB_SECTION}")
+set(CPACK_DEBIAN_PACKAGE_PRIORITY "${NEKO_DEB_PRIORITY}")
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ${NEKO_DEB_AUTO_DEPENDS})
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "${NEKO_DEB_DEPENDS}")
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "${NEKO_DEB_RECOMMENDS}")
+set(CPACK_DEBIAN_PACKAGE_SUGGESTS "${NEKO_DEB_SUGGESTS}")
+if(NEKO_HOMEPAGE)
+  set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "${NEKO_HOMEPAGE}")
+endif()
+if(NEKO_DEB_SCRIPTS)
+  set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "${NEKO_DEB_SCRIPTS}")
+endif()
+include(CPack)
+
+set(NEKO_STAGE_DIR "${NEKO_DIST_DIR}/${NEKO_PKG_NAME}")
+
+add_custom_target(tarball
+  COMMAND ${CMAKE_COMMAND} -E remove_directory "${NEKO_STAGE_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${NEKO_STAGE_DIR}"
+  COMMAND ${CMAKE_COMMAND} --install "${CMAKE_BINARY_DIR}" --component "${NEKO_PACKAGE_NAME}" --prefix "${NEKO_STAGE_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/tests" "${NEKO_STAGE_DIR}/share/paw/examples"
+  COMMAND ${CMAKE_COMMAND} -E tar czf "${NEKO_PKG_NAME}.tar.gz" "${NEKO_PKG_NAME}"
+  WORKING_DIRECTORY "${NEKO_DIST_DIR}"
+  VERBATIM)
+
+add_custom_target(deb
+  COMMAND ${CMAKE_CPACK_COMMAND} -G DEB --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+  VERBATIM)
+if(NOT "${PAW_TARGET}" STREQUAL "wasi" AND NOT DOGMAONLY)
+  add_dependencies(tarball pawc pawv dogma_s)
+  if(TARGET dogma_d)
+    add_dependencies(tarball dogma_d)
+  endif()
+elseif(TARGET dogma_s)
+  add_dependencies(tarball dogma_s)
+endif()
+
+add_custom_target(dist)
+add_dependencies(dist tarball deb)
+add_dependencies(deb tarball)
