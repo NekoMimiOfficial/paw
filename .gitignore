@@ -10,3 +10,6 @@ obj-*/
 build/
 wasmbuild/
 *.pawv
+
+nekpo_artifacts
+build-*
