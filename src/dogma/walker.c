@@ -35,6 +35,93 @@ static bool in_function = false;
 static int current_frame_bytes = 0;
 static size_t global_data_offset = GLOBAL_DATA_BASE;
 
+
+#define MAX_FUNCTIONS 256
+#define MAX_CALL_PATCHES 4096
+
+typedef struct {
+	const char *name;
+	nu_ast_node_t *node;
+	size_t pc;
+	int param_count;
+	int frame_bytes;
+} function_entry_t;
+
+typedef struct {
+	const char *name;
+	size_t call_pc;
+	size_t frame_adjust_pc;
+	int caller_index;
+} call_patch_t;
+
+static function_entry_t g_functions[MAX_FUNCTIONS];
+static size_t g_function_count = 0;
+static call_patch_t g_call_patches[MAX_CALL_PATCHES];
+static size_t g_call_patch_count = 0;
+static int g_current_function = -1;
+
+static void emit(Instruction inst);
+
+static int function_param_count(nu_ast_node_t *fn) {
+    for (nu_ast_node_t *c = fn ? fn->first_child : NULL; c; c = c->next_sibling) if (c->type == AST_PARAM_LIST) { int n = 0; for (nu_ast_node_t *p = c->first_child; p; p = p->next_sibling) if (p->type == AST_PARAM) n++; return n; }
+    return 0;
+}
+
+static void add_function_entry(nu_ast_node_t *fn) {
+    if (!fn || !fn->val.str || g_function_count >= MAX_FUNCTIONS) return;
+    for (size_t i = 0; i < g_function_count; i++) if (strcmp(g_functions[i].name, fn->val.str) == 0) { g_functions[i].node = fn; return; }
+    g_functions[g_function_count++] = (function_entry_t){fn->val.str, fn, 0, function_param_count(fn), 0};
+}
+
+static void add_call_patch(const char *name, size_t call_pc, size_t adjust_pc, int caller_index) {
+    if (g_call_patch_count >= MAX_CALL_PATCHES) { fprintf(stderr, _("Error: too many function calls in bytecode\n")); return; }
+    g_call_patches[g_call_patch_count++] = (call_patch_t){name, call_pc, adjust_pc, caller_index};
+}
+
+static void collect_local_symbols(nu_ast_node_t *node) {
+    if (!node || node->type == AST_FUNC_DECL) return;
+    if (node->type == AST_INT_DECL || node->type == AST_CHAR_DECL || node->type == AST_CONST_DECL) {
+        nu_ast_node_t *var = node->first_child;
+        if (var && var->val.str && (var->type == AST_VAR_DECL || var->type == AST_IDENT)) {
+            symb *existing = symtab_lookup(SymTable, var->val.str);
+            if (!existing || existing->scope != SCOPE_LOCAL) {
+                var_type_t type = node->type == AST_CHAR_DECL ? VAR_CHAR : VAR_INT;
+                symb *sym = symtab_add(SymTable, var->val.str, type);
+                if (sym) {
+                    sym->scope = SCOPE_LOCAL;
+                    sym->is_const = node->type == AST_CONST_DECL;
+                    for (nu_ast_node_t *c = node->first_child; c; c = c->next_sibling) if (c->type == AST_ARRAY_SIZE) { sym->is_array = 1; sym->array_size = (size_t)c->val.i64; sym->elem_size = type == VAR_CHAR ? 1 : 4; }
+                }
+            }
+        }
+    }
+    for (nu_ast_node_t *c = node->first_child; c; c = c->next_sibling) collect_local_symbols(c);
+}
+
+static void rebuild_global_symbols(nu_ast_node_t *root) {
+    if (!SymTable) return;
+    SymTable->head = NULL;
+    for (nu_ast_node_t *n = root ? root->first_child : NULL; n; n = n->next_sibling) {
+        if (n->type == AST_INT_DECL || n->type == AST_CHAR_DECL || n->type == AST_CONST_DECL) {
+            nu_ast_node_t *var = n->first_child;
+            if (!var || !var->val.str) continue;
+            symb *sym = symtab_add(SymTable, var->val.str, n->type == AST_CHAR_DECL ? VAR_CHAR : VAR_INT);
+            if (!sym) continue;
+            sym->scope = SCOPE_GLOBAL;
+            sym->is_const = n->type == AST_CONST_DECL;
+            for (nu_ast_node_t *c = n->first_child; c; c = c->next_sibling) if (c->type == AST_ARRAY_SIZE) { sym->is_array = 1; sym->array_size = (size_t)c->val.i64; sym->elem_size = sym->type == VAR_CHAR ? 1 : 4; }
+        } else if (n->type == AST_EXTERN_DECL && n->val.str) {
+            symb *sym = symtab_add(SymTable, n->val.str, VAR_STRING);
+            if (sym) { sym->is_ffi = 1; sym->scope = SCOPE_GLOBAL; }
+        }
+    }
+}
+
+static void emit_function_return(void) {
+    emit(EMIT_LOAD_MEM(FP, FP, 0));
+    emit(EMIT_RET());
+}
+
 #define FFI_TYPE_UNKNOWN 7
 
 int eval_expr(nu_ast_node_t *node);
@@ -1016,97 +1103,28 @@ int compile_expr(nu_ast_node_t *node, int target_reg) {
 
         case AST_FUNC_CALL: {
             nu_ast_node_t *target_fn = NULL;
-
-            for (nu_ast_node_t *child = g_root_node->first_child;
-                 child != NULL;
-                 child = child->next_sibling) {
-                if (child->type == AST_FUNC_DECL &&
-                    child->val.str &&
-                    node->val.str &&
-                    strcmp(child->val.str, node->val.str) == 0) {
-                    target_fn = child;
-                    break;
-                }
-            }
-
+            for (nu_ast_node_t *child = g_root_node->first_child; child; child = child->next_sibling) if (child->type == AST_FUNC_DECL && child->val.str && node->val.str && strcmp(child->val.str, node->val.str) == 0) { target_fn = child; break; }
             if (!target_fn) {
-                fprintf(
-                    stderr,
-                    _("Runtime Error: Undefined function '%s'\n"),
-                    node->val.str ? node->val.str : "?"
-                );
-
+                fprintf(stderr, _("Runtime Error: Undefined function '%s'\n"), node->val.str ? node->val.str : "?");
                 emit(EMIT_LOAD(target_reg, 0));
                 return target_reg;
             }
-
-            nu_ast_node_t *param_list = NULL;
-            nu_ast_node_t *block = NULL;
-
-            for (nu_ast_node_t *child = target_fn->first_child;
-                 child != NULL;
-                 child = child->next_sibling) {
-                if (child->type == AST_PARAM_LIST) {
-                    param_list = child;
-                }
-
-                if (child->type == AST_BLOCK) {
-                    block = child;
-                }
+            int expected = function_param_count(target_fn);
+            int argc = 0;
+            for (nu_ast_node_t *arg = node->first_child; arg; arg = arg->next_sibling) argc++;
+            if (argc != expected) {
+                fprintf(stderr, _("Error: function '%s' expects %d argument(s), got %d\n"), node->val.str, expected, argc);
+                emit(EMIT_LOAD(target_reg, 0));
+                return target_reg;
             }
-
-            nu_ast_node_t *param = param_list
-                ? param_list->first_child
-                : NULL;
-
-            nu_ast_node_t *arg = node->first_child;
-
-            while (param && arg) {
-                const char *param_name = param->val.str;
-
-                if (!param_name) {
-                    for (nu_ast_node_t *pchild = param->first_child;
-                         pchild != NULL;
-                         pchild = pchild->next_sibling) {
-                        if (pchild->type == AST_PARAM_NAME) {
-                            param_name = pchild->val.str;
-                            break;
-                        }
-                    }
-                }
-
-                if (param_name) {
-                    symb *sym = symtab_lookup(SymTable, param_name);
-
-                    if (!sym) {
-                        sym = symtab_add(SymTable, param_name, VAR_INT);
-                    }
-
-                    if (sym) {
-                        sym->scope = SCOPE_LOCAL;
-
-                        if (!sym->storage_allocated) {
-                            sym->location = alloc_stack_offset(4);
-                            sym->storage_allocated = 1;
-                        }
-
-                        compile_expr(arg, R1);
-                        emit(EMIT_STORE_MEM(R1, FP, sym->location));
-                    }
-                }
-
-                param = param->next_sibling;
-                arg = arg->next_sibling;
-            }
-
-            if (block) {
-                compile_node(block);
-            }
-
-            if (target_reg != R0) {
-                emit(EMIT_MOV(target_reg, R0));
-            }
-
+            for (nu_ast_node_t *arg = node->first_child; arg; arg = arg->next_sibling) { compile_expr(arg, R1); emit(EMIT_PUSH(R1)); }
+            emit(EMIT_PUSH(FP));
+            size_t adjust_pc = code_buf->count;
+            emit(EMIT_ADDI(FP, FP, 0));
+            size_t call_pc = code_buf->count;
+            emit(EMIT_CALL(0));
+            add_call_patch(node->val.str, call_pc, adjust_pc, g_current_function);
+            if (target_reg != R0) emit(EMIT_MOV(target_reg, R0));
             return target_reg;
         }
 
@@ -1264,22 +1282,54 @@ void compile_node(nu_ast_node_t *node) {
             break;
 
         case AST_FUNC_DECL: {
+            if (!node->val.str) break;
+            add_function_entry(node);
+            int fn_index = -1;
+            for (size_t i = 0; i < g_function_count; i++) if (g_functions[i].node == node) { fn_index = (int)i; break; }
+            if (fn_index < 0) break;
+            g_functions[fn_index].pc = code_buf->count;
             bool prev_in_func = in_function;
             int prev_frame_bytes = current_frame_bytes;
-
+            int prev_function = g_current_function;
+            symb *scope_head = SymTable ? SymTable->head : NULL;
             in_function = true;
             current_frame_bytes = 0;
-
-            for (nu_ast_node_t *child = node->first_child;
-                 child != NULL;
-                 child = child->next_sibling) {
-                if (child->type == AST_BLOCK) {
-                    compile_node(child);
-                }
+            g_current_function = fn_index;
+            nu_ast_node_t *param_list = NULL;
+            nu_ast_node_t *block = NULL;
+            for (nu_ast_node_t *child = node->first_child; child; child = child->next_sibling) {
+                if (child->type == AST_PARAM_LIST) param_list = child;
+                if (child->type == AST_BLOCK) block = child;
             }
-
+            symb *param_symbols[256];
+            int param_count = 0;
+            for (nu_ast_node_t *param = param_list ? param_list->first_child : NULL; param && param_count < 256; param = param->next_sibling) {
+                const char *name = NULL;
+                var_type_t type = VAR_INT;
+                for (nu_ast_node_t *pc = param->first_child; pc; pc = pc->next_sibling) {
+                    if (pc->type == AST_PARAM_NAME) name = pc->val.str;
+                    if (pc->type == AST_TYPE_SPEC && pc->val.str && strcmp(pc->val.str, "char") == 0) type = VAR_CHAR;
+                }
+                if (!name) continue;
+                symb *sym = symtab_add(SymTable, name, type);
+                if (!sym) continue;
+                sym->scope = SCOPE_LOCAL;
+                sym->location = alloc_stack_offset(4);
+                sym->storage_allocated = sym->location != 0;
+                param_symbols[param_count++] = sym;
+            }
+            collect_local_symbols(block);
+            emit(EMIT_POP(R14));
+            emit(EMIT_STORE_MEM(R14, FP, 0));
+            for (int i = param_count - 1; i >= 0; i--) { emit(EMIT_POP(R1)); emit(EMIT_STORE_MEM(R1, FP, param_symbols[i]->location)); }
+            if (block) compile_node(block);
+            emit_function_return();
+            g_functions[fn_index].param_count = param_count;
+            g_functions[fn_index].frame_bytes = current_frame_bytes;
+            if (SymTable) SymTable->head = scope_head;
             current_frame_bytes = prev_frame_bytes;
             in_function = prev_in_func;
+            g_current_function = prev_function;
             break;
         }
 
@@ -1620,11 +1670,8 @@ void compile_node(nu_ast_node_t *node) {
 
         case AST_RETURN_STMT: {
             nu_ast_node_t *val_node = node->first_child;
-
-            if (val_node) {
-                compile_expr(val_node, R0);
-            }
-
+            if (val_node) compile_expr(val_node, R0);
+            if (in_function) emit_function_return();
             break;
         }
 
@@ -1687,58 +1734,44 @@ bool write_bytecode_file(const char *filename, const BytecodeBuffer *buf) {
 
 void dogma_ast2file(nu_ast_node_t *node, const char *out_filename) {
     if (!node) return;
-
     g_root_node = node;
     code_buf = NULL;
     in_function = false;
     current_frame_bytes = 0;
     global_data_offset = GLOBAL_DATA_BASE;
-
+    g_function_count = 0;
+    g_call_patch_count = 0;
+    g_current_function = -1;
+    rebuild_global_symbols(node);
+    for (nu_ast_node_t *child = node->first_child; child; child = child->next_sibling) if (child->type == AST_FUNC_DECL) add_function_entry(child);
     emit(EMIT_LOAD(FP, RAM_SIZE - 4));
-
-    nu_ast_node_t *main_fn = NULL;
-
-    for (nu_ast_node_t *child = node->first_child;
-         child != NULL;
-         child = child->next_sibling) {
-        if (child->type == AST_FUNC_DECL &&
-            child->val.str &&
-            strcmp(child->val.str, "main") == 0) {
-            main_fn = child;
-            break;
-        }
-    }
-
-    if (main_fn) {
-        for (nu_ast_node_t *child = node->first_child;
-             child != NULL;
-             child = child->next_sibling) {
-            if (child->type == AST_CONST_DECL ||
-                child->type == AST_INT_DECL ||
-                child->type == AST_CHAR_DECL) {
-                compile_node(child);
-            }
-        }
-
-        compile_node(main_fn);
+    for (nu_ast_node_t *child = node->first_child; child; child = child->next_sibling) if (child->type == AST_CONST_DECL || child->type == AST_INT_DECL || child->type == AST_CHAR_DECL) compile_node(child);
+    int main_index = -1;
+    for (size_t i = 0; i < g_function_count; i++) if (strcmp(g_functions[i].name, "main") == 0) { main_index = (int)i; break; }
+    if (main_index >= 0) {
+        emit(EMIT_PUSH(FP));
+        emit(EMIT_ADDI(FP, FP, -4));
+        size_t main_call_pc = code_buf->count;
+        emit(EMIT_CALL(0));
+        add_call_patch("main", main_call_pc, main_call_pc - 1, -1);
+        emit(EMIT_HALT(R0));
     } else {
-        for (nu_ast_node_t *child = node->first_child;
-             child != NULL;
-             child = child->next_sibling) {
-            compile_node(child);
-        }
+        for (nu_ast_node_t *child = node->first_child; child; child = child->next_sibling) if (child->type != AST_FUNC_DECL && child->type != AST_CONST_DECL && child->type != AST_INT_DECL && child->type != AST_CHAR_DECL && child->type != AST_EXTERN_DECL) compile_node(child);
+        emit(EMIT_HALT(R0));
     }
-
-    emit(EMIT_HALT(R0));
-
+    for (nu_ast_node_t *child = node->first_child; child; child = child->next_sibling) if (child->type == AST_FUNC_DECL) compile_node(child);
+    for (size_t i = 0; i < g_call_patch_count; i++) {
+        call_patch_t *p = &g_call_patches[i];
+        int target = -1;
+        for (size_t j = 0; j < g_function_count; j++) if (strcmp(g_functions[j].name, p->name) == 0) { target = (int)j; break; }
+        if (target < 0) { fprintf(stderr, _("Error: unresolved function '%s'\n"), p->name); continue; }
+        code_buf->instructions[p->call_pc] = EMIT_CALL(g_functions[target].pc);
+        int frame_bytes = p->caller_index >= 0 ? g_functions[p->caller_index].frame_bytes : 0;
+        code_buf->instructions[p->frame_adjust_pc] = EMIT_ADDI(FP, FP, -(frame_bytes + 4));
+    }
     if (code_buf && code_buf->count > 0) {
         write_bytecode_file(out_filename, code_buf);
-
-        nu_free(
-            g_mm,
-            code_buf->instructions
-        );
-
+        nu_free(g_mm, code_buf->instructions);
         nu_free(g_mm, code_buf);
         code_buf = NULL;
     }

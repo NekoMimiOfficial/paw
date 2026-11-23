@@ -57,18 +57,59 @@ include_directories(
 
 if(NOT "${PAW_TARGET}" STREQUAL "wasi")
     include(FetchContent)
+
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
     FetchContent_Declare(
         dyncall
         URL https://dyncall.org/r1.4/dyncall-1.4.tar.gz
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
+
     FetchContent_MakeAvailable(dyncall)
 
     include_directories(
         ${dyncall_SOURCE_DIR}/dyncall
         ${dyncall_SOURCE_DIR}/dynload
     )
+
+    if("${PAW_STATIC}" STREQUAL "yes")
+        enable_language(CXX)
+
+        FetchContent_Declare(
+            solo
+            GIT_REPOSITORY https://github.com/pg83/solo.git
+            GIT_TAG main
+            GIT_SHALLOW TRUE
+        )
+
+        FetchContent_MakeAvailable(solo)
+
+        # Instead of running solo's broken shell script, we compile its dlfcn sources directly:
+        file(GLOB SOLO_DLFCN_SRCS 
+            "${solo_SOURCE_DIR}/lib/*.cpp"
+        )
+
+        add_library(solo_dlfcn STATIC ${SOLO_DLFCN_SRCS})
+        
+        target_include_directories(solo_dlfcn PUBLIC
+            "${solo_SOURCE_DIR}"
+            "${solo_SOURCE_DIR}/lib"
+        )
+        
+        target_compile_definitions(solo_dlfcn PRIVATE
+            COMPILE_DLOPEN
+            _GNU_SOURCE
+        )
+        target_compile_options(solo_dlfcn PRIVATE
+            -Wall -Wextra -O2 -g -std=c++20
+            -fpermissive
+            -Wno-error=narrowing
+            -Wno-error=invalid-constexpr
+            -Wno-error
+        )
+
+    endif()
 endif()
 
 add_subdirectory(lib/nu)
@@ -77,8 +118,42 @@ find_package(FLEX REQUIRED)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/dogma")
 flex_target(Dogmatic src/dogma/lex.l ${CMAKE_CURRENT_BINARY_DIR}/dogma/lex.yy.c)
 
+string(TIMESTAMP CURRENT_DATE "%d-%m-%Y %H:%M:%S")
+set(BUILD_DATE ${CURRENT_DATE})
+
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    set(GCC_VER "GCC ${CMAKE_C_COMPILER_VERSION}")
+else()
+    set(GCC_VER "N/A (Not GCC)")
+endif()
+
+find_package(Git)
+
+if(GIT_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_BRANCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+else()
+    set(GIT_BRANCH "unknown")
+endif()
+
+if(NOT GIT_BRANCH OR "${GIT_BRANCH}" STREQUAL "")
+    set(GIT_BRANCH "detached")
+endif()
+
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/meta.c"
+    "${CMAKE_CURRENT_BINARY_DIR}/genmeta.c"
+    @ONLY
+)
+
 file(GLOB DOGMA_SRCS "src/dogma/*.c")
 list(APPEND DOGMA_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/src/common/lson.c")
+list(APPEND DOGMA_SRCS "${CMAKE_CURRENT_BINARY_DIR}/genmeta.c")
 
 add_compile_options(-include ${CMAKE_CURRENT_SOURCE_DIR}/include/prel.h)
 

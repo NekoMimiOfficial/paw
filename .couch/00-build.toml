@@ -1,0 +1,25 @@
+[stage]
+name = "build"
+timeout = 600
+retries = 1
+
+[[steps]]
+name = "update"
+run = "git submodule update --init --recursive --force"
+
+[[steps]]
+name = "configure"
+run = "cmake -S . -B build -DPAW_TARGET=native"
+
+[[steps]]
+name = "compile"
+run = "cmake --build build --parallel 2"
+timeout = 120
+
+[artifacts]
+paths = [
+  "build/pawc",
+  "build/pawv", 
+  "build/libdogma.so",
+  "build/libdogma.a",
+]

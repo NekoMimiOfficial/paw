@@ -11,7 +11,11 @@
 
 #ifndef WASI
 #include <dyncall.h>
+#ifdef PAW_STATIC
+#include <dlfcn.h>
+#else
 #include <dynload.h>
+#endif
 #include <pawffi.h>
 #endif
 
@@ -25,7 +29,7 @@
 #include <nosry/disasm.h>
 
 nu_mm_t *g_mm = NULL;
-char backing[1024 * 1024 * 8];
+char backing[1024 * 1024 * 20];
 char *current_filename = NULL;
 
 #ifndef WASI
@@ -42,7 +46,11 @@ LsonTranslator *g_translator = NULL;
 typedef struct {
     char *requested_name;
     char *resolved_path;
+#ifdef PAW_STATIC
+    void *handle;
+#else
     DLLib *handle;
+#endif
     const paw_library_t *info;
 } paw_loaded_library_t;
 
@@ -147,7 +155,11 @@ static paw_loaded_library_t *load_paw_library(const char *requested) {
         return NULL;
     }
 
+#ifdef PAW_STATIC
+    void *handle = dlopen(resolved, RTLD_NOW | RTLD_LOCAL);
+#else
     DLLib *handle = dlLoadLibrary(resolved);
+#endif
 
     if (!handle) {
         fprintf(stderr, _("FFI error: failed to load module '%s'\n"), resolved);
@@ -155,11 +167,19 @@ static paw_loaded_library_t *load_paw_library(const char *requested) {
         return NULL;
     }
 
+#ifdef PAW_STATIC
+    void *info_symbol = dlsym(handle, "paw_library_info");
+#else
     void *info_symbol = dlFindSymbol(handle, "paw_library_info");
+#endif
 
     if (!info_symbol) {
         fprintf(stderr, _("FFI error: module '%s' does not export paw_library_info\n"), resolved);
+#ifdef PAW_STATIC
+        dlclose(handle);
+#else
         dlFreeLibrary(handle);
+#endif
         free(resolved);
         return NULL;
     }
@@ -169,7 +189,11 @@ static paw_loaded_library_t *load_paw_library(const char *requested) {
 
     if (!info) {
         fprintf(stderr, _("FFI error: module '%s' returned NULL metadata\n"), resolved);
+#ifdef PAW_STATIC
+        dlclose(handle);
+#else
         dlFreeLibrary(handle);
+#endif
         free(resolved);
         return NULL;
     }
@@ -178,14 +202,22 @@ static paw_loaded_library_t *load_paw_library(const char *requested) {
         fprintf(stderr, _("FFI error: module '%s' has incompatible Paw FFI ABI\n"), resolved);
         fprintf(stderr, "  module ABI: %u\n", info->abi_version);
         fprintf(stderr, "  runtime ABI: %u\n", PAW_FFI_ABI_VERSION);
+#ifdef PAW_STATIC
+        dlclose(handle);
+#else
         dlFreeLibrary(handle);
+#endif
         free(resolved);
         return NULL;
     }
 
     if (!info->functions && info->function_count != 0) {
         fprintf(stderr, _("FFI error: module '%s' has a NULL function table\n"), resolved);
+#ifdef PAW_STATIC
+        dlclose(handle);
+#else
         dlFreeLibrary(handle);
+#endif
         free(resolved);
         return NULL;
     }
@@ -195,28 +227,44 @@ static paw_loaded_library_t *load_paw_library(const char *requested) {
 
         if (!fn->name || !*fn->name) {
             fprintf(stderr, _("FFI error: module '%s' contains a function with no name\n"), resolved);
+#ifdef PAW_STATIC
+            dlclose(handle);
+#else
             dlFreeLibrary(handle);
+#endif
             free(resolved);
             return NULL;
         }
 
         if (!fn->address) {
             fprintf(stderr, _("FFI error: module '%s' function '%s' has a NULL address\n"), resolved, fn->name);
+#ifdef PAW_STATIC
+            dlclose(handle);
+#else
             dlFreeLibrary(handle);
+#endif
             free(resolved);
             return NULL;
         }
 
         if (fn->arg_count > 15) {
             fprintf(stderr, _("FFI error: module '%s' function '%s' has %u arguments; Paw supports at most 15\n"), resolved, fn->name, fn->arg_count);
+#ifdef PAW_STATIC
+            dlclose(handle);
+#else
             dlFreeLibrary(handle);
+#endif
             free(resolved);
             return NULL;
         }
 
         if (!ffi_type_valid((paw_ffi_type_t)fn->return_type)) {
             fprintf(stderr, _("FFI error: module '%s' function '%s' has invalid return type %u\n"), resolved, fn->name, fn->return_type);
+#ifdef PAW_STATIC
+            dlclose(handle);
+#else
             dlFreeLibrary(handle);
+#endif
             free(resolved);
             return NULL;
         }
@@ -224,7 +272,11 @@ static paw_loaded_library_t *load_paw_library(const char *requested) {
         for (uint32_t a = 0; a < fn->arg_count; ++a) {
             if (!ffi_type_valid((paw_ffi_type_t)fn->args[a]) || fn->args[a] == PAW_FFI_VOID) {
                 fprintf(stderr, _("FFI error: module '%s' function '%s' has invalid argument type %u at argument %u\n"), resolved, fn->name, fn->args[a], a + 1);
+#ifdef PAW_STATIC
+                dlclose(handle);
+#else
                 dlFreeLibrary(handle);
+#endif
                 free(resolved);
                 return NULL;
             }
@@ -239,7 +291,11 @@ static paw_loaded_library_t *load_paw_library(const char *requested) {
     lib->info = info;
 
     if (!lib->requested_name) {
+#ifdef PAW_STATIC
+        dlclose(handle);
+#else
         dlFreeLibrary(handle);
+#endif
         free(lib->resolved_path);
         g_library_count--;
         return NULL;
@@ -384,8 +440,8 @@ static int unpack_ffi_types(VM *vm, uint32_t *argc, uint64_t *types) {
     if (vm->SP + 3 > MAX_STACK_SIZE) return 0;
 
     uint32_t high = vm->stack[vm->SP++];
-    uint32_t low  = vm->stack[vm->SP++];
-    *argc          = vm->stack[vm->SP++];
+    uint32_t low = vm->stack[vm->SP++];
+    *argc = vm->stack[vm->SP++];
 
     *types = (uint64_t)low | ((uint64_t)high << 32);
 
@@ -460,11 +516,13 @@ static void custom_syscalls(VM *vm, Memory *mem, u32 sys_code) {
 
         case PAW_SYS_PRINTF: {
             const char *fmt = VM_get_string(vm, vm->regs[0]);
-	    if (fmt) {
-        	   VM_printf(vm, mem, 1, 15, fmt);
-	    } else {
-	           fprintf(stderr, "DEBUG: String was NULL!\n");
-	    }
+
+            if (fmt) {
+                VM_printf(vm, mem, 1, 15, fmt);
+            } else {
+                fprintf(stderr, "DEBUG: String was NULL!\n");
+            }
+
             break;
         }
 
@@ -585,13 +643,12 @@ static void custom_syscalls(VM *vm, Memory *mem, u32 sys_code) {
 #else
         case PAW_SYS_FFI_CHECK:
         case PAW_SYS_FFI_CALL:
-        case PAW_SYS_FFI_PRINT: 
-	case PAW_SYS_FFI_LOOKUP: {
-	    fprintf(stderr, _("FFI: Unavailable in WASI Mode\n"));
-	    break;
-	}
-
+        case PAW_SYS_FFI_PRINT:
+        case PAW_SYS_FFI_LOOKUP:
+            fprintf(stderr, _("FFI: Unavailable in WASI Mode\n"));
+            break;
 #endif
+
         default:
             fprintf(stderr, _("Fault: Unhandled System Call %u\n"), sys_code);
             vm->is_running = 0;
@@ -602,7 +659,14 @@ static void custom_syscalls(VM *vm, Memory *mem, u32 sys_code) {
 #ifndef WASI
 static void cleanup_paw_libraries(void) {
     for (size_t i = 0; i < g_library_count; ++i) {
-        if (g_libraries[i].handle) dlFreeLibrary(g_libraries[i].handle);
+        if (g_libraries[i].handle) {
+#ifdef PAW_STATIC
+            dlclose(g_libraries[i].handle);
+#else
+            dlFreeLibrary(g_libraries[i].handle);
+#endif
+        }
+
         free(g_libraries[i].requested_name);
         free(g_libraries[i].resolved_path);
     }
@@ -613,7 +677,7 @@ static void cleanup_paw_libraries(void) {
 #endif
 
 int main(int argc, char **argv) {
-    g_mm = nu_mm_create(NU_MM_ARENA, backing, sizeof(backing));
+    g_mm = nu_mm_create(NU_MM_SLOB, backing, sizeof(backing));
 
     if (!g_mm) {
         glog_log(NULL, 0, 0, GLOG_FATAL, _("Fatal: Failed to allocate memory arena!"));
@@ -622,7 +686,6 @@ int main(int argc, char **argv) {
 
     LsonTranslator lson;
     lson_init(&lson, g_mm);
-
     g_translator = &lson;
 
     glog_init();
@@ -630,6 +693,7 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         glog_log(NULL, 0, 0, GLOG_INFO, _("Usage: %s <bytecode.pawv>\n"), get_basename(argv[0]));
+        nu_mm_destroy(g_mm);
         return EXIT_FAILURE;
     }
 
@@ -648,21 +712,26 @@ int main(int argc, char **argv) {
 
     if (argc > 2 && strcmp(argv[1], "-d") == 0) {
         FILE *f = fopen(argv[2], "rb");
+
         if (!f) {
             printf(_("Failed to open file for disassembly: %s\n"), argv[2]);
+            nu_mm_destroy(g_mm);
             return -1;
         }
 
         size_t prog_len = 0;
+
         if (VM_import_stream(vm, f, mem, &prog_len, load_vaddr) == 0) {
             printf("Disassembled %s (size: %ld)\n", argv[2], prog_len);
             VM_disassemble_stream(mem->rom, prog_len, stdout);
             fclose(f);
+            nu_mm_destroy(g_mm);
             return 0;
         }
 
         printf("Failed to parse binary stream: %s\n", argv[2]);
         fclose(f);
+        nu_mm_destroy(g_mm);
         return -1;
     }
 
@@ -697,6 +766,7 @@ int main(int argc, char **argv) {
 
 #ifndef WASI
     cleanup_paw_libraries();
+
     if (g_vm_ffi) dcFree(g_vm_ffi);
 #endif
 
